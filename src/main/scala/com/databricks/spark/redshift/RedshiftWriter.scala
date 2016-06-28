@@ -172,32 +172,36 @@ private[redshift] class RedshiftWriter(
       // Load the temporary data into the new file
       val copyStatement = copySql(data.sqlContext, params, creds, manifestUrl)
       log.info(copyStatement)
-      try {
-        jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
-      } catch {
-        case e: SQLException =>
-          // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
-          // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
-          val errorLookupQuery =
-            """
-              | SELECT *
-              | FROM stl_load_errors
-              | WHERE query = pg_last_query_id()
-            """.stripMargin
-          val detailedException: Option[SQLException] = try {
-            val results =
-              jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(errorLookupQuery))
-            if (results.next()) {
-              val errCode = results.getInt("err_code")
-              val errReason = results.getString("err_reason").trim
-              val columnLength: String =
-                Option(results.getString("col_length"))
-                  .map(_.trim)
-                  .filter(_.nonEmpty)
-                  .map(n => s"($n)")
-                  .getOrElse("")
-              val exceptionMessage =
-                s"""
+      var success = false
+
+      for (i <- 1 to 3; if success == false) {
+        try {
+          jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
+          success = true
+        } catch {
+          case e: SQLException =>
+            // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
+            // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
+            val errorLookupQuery =
+              """
+                | SELECT *
+                | FROM stl_load_errors
+                | WHERE query = pg_last_query_id()
+              """.stripMargin
+            val detailedException: Option[SQLException] = try {
+              val results =
+                jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(errorLookupQuery))
+              if (results.next()) {
+                val errCode = results.getInt("err_code")
+                val errReason = results.getString("err_reason").trim
+                val columnLength: String =
+                  Option(results.getString("col_length"))
+                    .map(_.trim)
+                    .filter(_.nonEmpty)
+                    .map(n => s"($n)")
+                    .getOrElse("")
+                val exceptionMessage =
+                  s"""
                    |Error (code $errCode) while loading data into Redshift: "$errReason"
                    |Table name: ${params.table.get}
                    |Column name: ${results.getString("colname").trim}
@@ -205,17 +209,25 @@ private[redshift] class RedshiftWriter(
                    |Raw line: ${results.getString("raw_line")}
                    |Raw field value: ${results.getString("raw_field_value")}
                   """.stripMargin
-              Some(new SQLException(exceptionMessage, e))
-            } else {
-              None
+                Some(new SQLException(exceptionMessage, e))
+              } else {
+                None
+              }
+            } catch {
+              case NonFatal(e2) =>
+                log.error("Error occurred while querying STL_LOAD_ERRORS", e2)
+                None
             }
-          } catch {
-            case NonFatal(e2) =>
-              log.error("Error occurred while querying STL_LOAD_ERRORS", e2)
-              None
-          }
-          throw detailedException.getOrElse(e)
+
+            if (i >= 3) {
+              throw detailedException.getOrElse(e)
+            }
+            else {
+              Thread.sleep(i*5000) // multiple of 5 seconds
+            }
+        }
       }
+      
     }
 
     // Execute postActions
